@@ -12,6 +12,7 @@
 //
 // TODO:Student Information
 //
+
 const char *studentName = "TODO";
 const char *studentID = "TODO";
 const char *email = "TODO";
@@ -28,6 +29,19 @@ const char *bpName[4] = {"Static", "Gshare",
 int ghistoryBits = 15; // Number of bits used for Global History
 int bpType;            // Branch Prediction Type
 int verbose;
+int ghistoryBits_tournament = 15;
+int lhistoryBits = 12;
+int pcIndexBits = 12;
+
+int tagBits = 9; // tag bits per entry
+int tag_ctr_bits = 3;
+int tag_u_bits = 2;
+int tag_valid_bits = 1;
+
+// GHR size (we chose 64 bits)
+int ghr_bits = 64
+
+#define TAG_ENTRY_BITS    (tagBits + tag_ctr_bits + tag_u_bits + tag_valid_bits)
 
 //------------------------------------//
 //      Predictor Data Structures     //
@@ -39,6 +53,14 @@ int verbose;
 // gshare
 uint8_t *bht_gshare;
 uint64_t ghistory;
+//
+// tournament
+uint16_t ghr;
+uint16_t *localHistoryTable;
+uint8_t *bht_local;
+uint8_t *bht_global;
+uint8_t *chooserTable;
+
 
 //------------------------------------//
 //        Predictor Functions         //
@@ -120,6 +142,146 @@ void cleanup_gshare()
   free(bht_gshare);
 }
 
+// tournament functions
+void init_tournament()
+{
+  int lht_entries = 1 << pcIndexBits;
+  localHistoryTable = (uint16_t *)malloc(lht_entries * sizeof(uint16_t));
+
+  int bht_local_entries = 1 << lhistoryBits;
+  bht_local = (uint8_t *)malloc(bht_local_entries * sizeof(uint8_t));
+
+  int bht_global_entries = 1 << ghistoryBits_tournament;
+  bht_global = (uint8_t *)malloc(bht_global_entries * sizeof(uint8_t));
+
+  int chooser_entries = 1 << ghistoryBits_tournament;
+  chooserTable = (uint8_t *)malloc(chooser_entries * sizeof(uint8_t));
+
+  for (int i = 0; i < lht_entries; i++)
+  {
+    localHistoryTable[i] = 0;
+  }
+
+  for (int i = 0; i < bht_local_entries; i++)
+  {
+    bht_local[i] = SNK; //slightly not taken
+  }
+
+  for (int i = 0; i < bht_global_entries; i++)
+  {
+    bht_global[i] = WN;
+  }
+
+  for (int i = 0; i < chooser_entries; i++)
+  {
+    chooserTable[i] = WEAK_LOCAL;
+  }
+  
+  ghr = 0;
+}
+
+uint8_t get_local_prediction(uint32_t bht_local_index)
+{
+  return (bht_local[bht_local_index] >= 4) ? TAKEN : NOTTAKEN;
+}
+
+uint8_t get_global_prediction(uint32_t bht_global_index)
+{
+  return (bht_global[bht_global_index] >= 2) ? TAKEN : NOTTAKEN;
+}
+
+uint8_t tournament_predict(uint32_t pc)
+{
+  // get lower historyBits of pc, lht and ghr
+  int lht_entries = 1 << pcIndexBits;
+  uint32_t lht_index = pc & (lht_entries - 1);
+    
+  // Get local history for this PC
+  uint32_t local_history = localHistoryTable[lht_index] & ((1u << lhistoryBits) - 1);
+  
+  // Index into bht_local (3-bit counter)
+  uint32_t bht_local_index = local_history;
+  
+  // Index into bht_global(2-bit) and Chooser tables(2-bit) using GHR
+  uint32_t bht_global_index = ghr & ((1u << ghistoryBits_tournament) - 1);
+
+  switch (chooserTable[bht_global_index])
+  {
+      case STRONG_LOCAL:   // 0
+      case WEAK_LOCAL:     // 1
+          return get_local_prediction(bht_local_index);
+
+      case WEAK_GLOBAL:    // 2
+      case STRONG_GLOBAL:  // 3
+          return get_global_prediction(bht_global_index);
+
+      default:
+          printf("Warning: Undefined state in chooser table!\n");
+          return NOTTAKEN;
+  }
+}
+
+void train_tournament(uint32_t pc, uint8_t outcome)
+{
+  // get lower historyBits of pc, lht and ghr
+  int lht_entries = 1 << pcIndexBits;
+  uint32_t lht_index = pc & (lht_entries - 1);
+    
+  // Get local history for this PC
+  uint32_t local_history = localHistoryTable[lht_index] & ((1u << lhistoryBits) - 1);
+  
+  // Index into bht_local (3-bit counter)
+  uint32_t bht_local_index = local_history;
+  
+  // Index into bht_global(2-bit) and Chooser tables(2-bit) using GHR
+  uint32_t bht_global_index = ghr & ((1u << ghistoryBits_tournament) - 1);
+
+  uint8_t local_pred = get_local_prediction(bht_local_index);
+  uint8_t global_pred = get_global_prediction(bht_global_index);
+
+  if (local_pred != global_pred)
+  {
+    if (local_pred == outcome && chooserTable[bht_global_index] > STRONG_LOCAL)
+        chooserTable[bht_global_index]--; // favor local
+    else if (global_pred == outcome && chooserTable[bht_global_index] < STRONG_GLOBAL)
+        chooserTable[bht_global_index]++; // favor global
+  }
+
+  if (outcome == TAKEN)
+  {
+      if (bht_local[bht_local_index] < STKN) 
+        bht_local[bht_local_index]++;
+  }
+  else
+  {
+      if (bht_local[bht_local_index] > SNTKN) 
+        bht_local[bht_local_index]--;
+  }
+
+  if (outcome == TAKEN)
+  {
+      if (bht_global[bht_global_index] < ST) 
+        bht_global[bht_global_index]++;
+  }
+  else
+  {
+      if (bht_global[bht_global_index] > SN) 
+        bht_global[bht_global_index]--;
+  }
+
+  localHistoryTable[lht_index] = ((localHistoryTable[lht_index] << 1) | (outcome & 1)) & ((1u << lhistoryBits) - 1);
+  ghr = ((ghr << 1) | (outcome & 1)) & ((1u << ghistoryBits_tournament) - 1);
+
+}
+
+void cleanup_tournament()
+{
+  free(localHistoryTable);
+  free(bht_local);
+  free(bht_global);
+  free(chooserTable);
+}
+
 void init_predictor()
 {
   switch (bpType)
@@ -130,6 +292,7 @@ void init_predictor()
     init_gshare();
     break;
   case TOURNAMENT:
+    init_tournament();
     break;
   case CUSTOM:
     break;
@@ -153,7 +316,7 @@ uint32_t make_prediction(uint32_t pc, uint32_t target, uint32_t direct)
   case GSHARE:
     return gshare_predict(pc);
   case TOURNAMENT:
-    return NOTTAKEN;
+    return tournament_predict(pc);
   case CUSTOM:
     return NOTTAKEN;
   default:
@@ -180,7 +343,7 @@ void train_predictor(uint32_t pc, uint32_t target, uint32_t outcome, uint32_t co
     case GSHARE:
       return train_gshare(pc, outcome);
     case TOURNAMENT:
-      return;
+      return train_tournament(pc, outcome);;
     case CUSTOM:
       return;
     default:
