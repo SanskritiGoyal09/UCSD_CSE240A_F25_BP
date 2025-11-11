@@ -29,19 +29,19 @@ const char *bpName[4] = {"Static", "Gshare",
 int ghistoryBits = 15; // Number of bits used for Global History
 int bpType;            // Branch Prediction Type
 int verbose;
+
 int ghistoryBits_tournament = 15;
 int lhistoryBits = 12;
 int pcIndexBits = 12;
 
-int tagBits = 9; // tag bits per entry
-int tag_ctr_bits = 3;
-int tag_u_bits = 2;
-int tag_valid_bits = 1;
+int base_entries = 2048;
+const int num_tag_tables = 4;
+uint64_t UGR_PERIOD = 262144ULL;// 256K branches
+int HIST_LENGTHS[num_tag_tables + 1] = {0, 14, 15, 44, 128};
 
-// GHR size (we chose 64 bits)
-int ghr_bits = 64
+int ghr_bits = 128;
 
-#define TAG_ENTRY_BITS    (tagBits + tag_ctr_bits + tag_u_bits + tag_valid_bits)
+//#define TAG_ENTRY_BITS    (tagBits + tag_ctr_bits + tag_u_bits + tag_valid_bits)
 
 //------------------------------------//
 //      Predictor Data Structures     //
@@ -60,7 +60,41 @@ uint16_t *localHistoryTable;
 uint8_t *bht_local;
 uint8_t *bht_global;
 uint8_t *chooserTable;
+//
+// custom
+uint64_t ghr_custom_1;
+uint64_t ghr_custom_2;
+uint8_t last_pred;
+int last_provider;
+uint64_t branch_count;
 
+struct BaseEntry {
+    uint8_t ctr;   //2-bit ctr
+};
+
+struct TaggedEntry {
+    uint16_t tag;  
+    uint8_t ctr : 3;   //3-bit ctr
+    uint8_t u : 2;     
+    uint8_t valid : 1;
+};
+
+struct tage_table {
+    int tableSize;
+    int historyBits;
+    int numTagBits;
+};
+
+// Geometric history lengths and tag bits
+tage_table tageTables[num_tag_tables] = {
+    {.tableSize = 1024, .historyBits = HIST_LENGTHS[1], .numTagBits = 9},   // T1 short-history
+    {.tableSize = 1024, .historyBits = HIST_LENGTHS[2], .numTagBits = 9},   // T2 medium-short
+    {.tableSize = 1024,  .historyBits = HIST_LENGTHS[3], .numTagBits = 10},  // T3 medium-long
+    {.tableSize = 1024,  .historyBits = HIST_LENGTHS[4], .numTagBits = 10}   // T4 long-history
+};
+
+BaseEntry* base_bht_table;
+TaggedEntry** tag_tables;
 
 //------------------------------------//
 //        Predictor Functions         //
@@ -282,6 +316,254 @@ void cleanup_tournament()
   free(chooserTable);
 }
 
+//custom functions
+void init_tage() {
+  base_bht_table = (BaseEntry*)malloc(base_entries * sizeof(BaseEntry));
+  tag_tables = (TaggedEntry**)malloc(num_tag_tables * sizeof(TaggedEntry*));
+
+  for (int t = 0; t < num_tag_tables; t++)
+      tag_tables[t] = (TaggedEntry*)malloc(tageTables[t].tableSize * sizeof(TaggedEntry));
+
+  for (int i = 0; i < base_entries; i++)
+      base_bht_table[i].ctr = 1; // weakly not-taken
+
+  for (int t = 0; t < num_tag_tables; t++)
+  {  
+    for (int i = 0; i < tageTables[t].tableSize; i++) 
+    {
+      tag_tables[t][i].valid = 0;
+      tag_tables[t][i].ctr = 4; // weakly not-taken
+      tag_tables[t][i].u = 0;
+      tag_tables[t][i].tag = 0;
+    }
+  }
+
+  ghr_custom_1 = 0;
+  ghr_custom_2 = 0;
+  branch_count = 0;
+  last_pred = 0;
+  last_provider = -1;
+}
+
+static inline uint32_t fold_history_xor(uint64_t ghr, int hist_len, int out_bits) {
+    // Fold 'hist_len' low bits of ghr into an out_bits-sized value via XOR folding.
+    // out_bits is assumed to be power-of-two width mask size (i.e., tableSize mask bits).
+    uint32_t mask = (1u << out_bits) - 1;
+    uint32_t folded = 0;
+    int i = 0;
+    int pos = 0;
+    while (i < hist_len) {
+        // take up to out_bits bits chunk
+        uint32_t chunk = (uint32_t)((ghr >> i) & mask);
+        folded ^= chunk << pos;
+        // reduce folded to mask
+        folded = (folded & mask) ^ (folded >> out_bits);
+        i += out_bits;
+    }
+    return folded & mask;
+}
+
+// Compute index into a table (table->tableSize is power of two)
+uint32_t compute_index(uint32_t pc, const tage_table *table) {
+    uint32_t mask = table->tableSize - 1;
+    uint32_t folded_history = 0;
+
+    int remaining_bits = table->historyBits;
+    int i = 0;
+
+    // Fold newer 64 bits
+    while (remaining_bits > 0 && i < 64) {
+        int bits = (remaining_bits < 32) ? remaining_bits : 32;
+        folded_history ^= (uint32_t)((ghr_custom_2 >> i) & ((1ULL << bits) - 1));
+        i += bits;
+        remaining_bits -= bits;
+    }
+
+    // Fold older 64 bits if needed
+    i = 0;
+    while (remaining_bits > 0 && i < 64) {
+        int bits = (remaining_bits < 32) ? remaining_bits : 32;
+        folded_history ^= (uint32_t)((ghr_custom_1 >> i) & ((1ULL << bits) - 1));
+        i += bits;
+        remaining_bits -= bits;
+    }
+
+    return (pc ^ folded_history) & mask;
+  }
+
+uint16_t compute_tag(uint32_t pc, const tage_table *table) {
+    uint32_t mask = (1 << table->numTagBits) - 1;
+    uint32_t folded_history = 0;
+
+    int remaining_bits = table->historyBits;
+    int i = 0;
+
+    while (remaining_bits > 0 && i < 64) {
+        int bits = (remaining_bits < table->numTagBits) ? remaining_bits : table->numTagBits;
+        folded_history ^= (uint32_t)((ghr_custom_2 >> i) & ((1ULL << bits) - 1));
+        i += bits;
+        remaining_bits -= bits;
+    }
+
+    i = 0;
+    while (remaining_bits > 0 && i < 64) {
+        int bits = (remaining_bits < table->numTagBits) ? remaining_bits : table->numTagBits;
+        folded_history ^= (uint32_t)((ghr_custom_1 >> i) & ((1ULL << bits) - 1));
+        i += bits;
+        remaining_bits -= bits;
+    }
+
+    return (pc ^ folded_history) & mask;
+}
+
+
+uint8_t tage_predict(uint32_t pc) {
+    last_provider = -1;
+    int alt_provider = -1;
+
+    // base prediction from base table
+    uint8_t base_taken = (base_bht_table[pc % base_entries].ctr >= 2) ? 1 : 0;
+    uint8_t pred = base_taken;
+    uint8_t altpred = base_taken;
+
+    // scan tag tables from longest history (highest index) to shortest (0)
+    for (int t = num_tag_tables - 1; t >= 0; t--) {
+        const struct tage_table *tb = &tageTables[t];
+        uint32_t idx = compute_index(pc, tb);
+        uint16_t tag = compute_tag(pc, tb);
+        TaggedEntry *e = &tag_tables[t][idx];
+        if (e->valid && e->tag == tag) {
+            if (last_provider == -1) {
+                last_provider = t;
+            } else if (alt_provider == -1) {
+                alt_provider = t;
+                // don't break - we may want additional bookkeeping, but two is fine
+            }
+        }
+    }
+
+    // alt_pred: from alt_provider if present, else base
+    if (alt_provider != -1) {
+        const struct tage_table *alt_tb = &tageTables[alt_provider];
+        uint32_t idx_alt = compute_index(pc, alt_tb);
+        TaggedEntry *e_alt = &tag_tables[alt_provider][idx_alt];
+        altpred = (e_alt->ctr >= 4) ? 1 : 0;
+    } else {
+        altpred = base_taken;
+    }
+
+    // provider prediction: if provider exists use its ctr (with usefulness check)
+    if (last_provider != -1) {
+        const struct tage_table *prov_tb = &tageTables[last_provider];
+        uint32_t idx = compute_index(pc, prov_tb);
+        TaggedEntry *prov = &tag_tables[last_provider][idx];
+        uint8_t prov_pred = (prov->ctr >= 4) ? 1 : 0;
+
+        // if not useful and weak, use altpred
+        uint8_t weak = (prov->ctr == 3 || prov->ctr == 4);
+        if ((prov->u == 0) && weak) {
+            pred = altpred;
+        } else {
+            pred = prov_pred;
+        }
+    } else {
+        pred = base_taken;
+    }
+
+    last_pred = pred;
+    return pred;
+}
+
+void allocate_on_mispredict(uint32_t pc, int provider, uint8_t outcome) {
+    // Scan from provider-1 downwards to find an entry to allocate (prefer shorter histories)
+    for (int t = provider - 1; t >= 0; t--) {
+        const struct tage_table *tb = &tageTables[t];
+        uint32_t idx = compute_index(pc, tb);
+        TaggedEntry *e = &tag_tables[t][idx];
+        if (!e->valid) {
+            // allocate new entry
+            e->valid = 1;
+            e->tag = compute_tag(pc, tb);
+            // initialize counter toward the outcome but weakly
+            e->ctr = (outcome == TAKEN) ? 5 : 2; // e.g. weakly taken vs weakly not
+            e->u = 0;
+            return;
+        } else if (e->u == 0) {
+            // steal an entry with u==0
+            e->valid = 1;
+            e->tag = compute_tag(pc, tb);
+            e->ctr = (outcome == TAKEN) ? 5 : 2;
+            e->u = 0;
+            return;
+        }
+    }
+    // no allocation possible
+}
+
+void maybe_graceful_u_reset() {
+    // Every UGR_PERIOD branches, halve all u counters (right-shift) to decay usefulness.
+    if ((branch_count != 0) && ((branch_count % UGR_PERIOD) == 0)) {
+        for (int t = 0; t < num_tag_tables; t++) {
+            for (int i = 0; i < tageTables[t].tableSize; i++) {
+                tag_tables[t][i].u >>= 1;
+            }
+        }
+    }
+}
+
+void train_tage(uint32_t pc, uint8_t outcome) {
+    branch_count++;
+    bool base_is_provider = (last_provider == -1);
+
+    // Base predictor update
+    if (base_is_provider) {
+        uint8_t &base_ctr = base_bht_table[pc % base_entries].ctr;
+        if (outcome == TAKEN) {
+            if(base_ctr < 3) base_ctr++;
+        } else {
+            if(base_ctr > 0) base_ctr--;
+        }
+    }
+
+    // Tagged table update
+    if (!base_is_provider) {
+        uint8_t altpred;
+        uint32_t idx = compute_index(pc, &tageTables[last_provider]);
+        TaggedEntry &prov = tag_tables[last_provider][idx];
+
+        // Compute alt prediction from lower tables or base
+        altpred = (base_bht_table[pc % base_entries].ctr >= 2) ? 1 : 0;
+        for (int t = last_provider - 1; t >= 0; t--) {
+            uint32_t idx_alt = compute_index(pc, &tageTables[t]);
+            TaggedEntry &e = tag_tables[t][idx_alt];
+            if (e.valid && e.tag == compute_tag(pc, &tageTables[t])) {
+                altpred = (e.ctr >= 4) ? 1 : 0;
+                break;
+            }
+        }
+
+        // Update useful counter
+        if (altpred != last_pred) {
+            if (last_pred == outcome && prov.u < U_MAX) prov.u++;
+            else if (last_pred != outcome && prov.u > U_MIN) prov.u--;
+        }
+
+        // Update prediction counter
+        if (outcome == TAKEN && prov.ctr < 7) prov.ctr++;
+        else if (outcome == NOTTAKEN && prov.ctr > 0) prov.ctr--;
+    }
+
+    // Allocate on misprediction
+    if (!base_is_provider && outcome != last_pred && last_provider < num_tag_tables - 1)
+        allocate_on_mispredict(pc, last_provider, outcome);
+
+    // Update 128-bit GHR
+    uint64_t new_bit = (uint64_t)outcome & 1;
+    ghr_custom_1 = (ghr_custom_1 << 1) | (ghr_custom_2 >> 63); // older 64 bits shift in top bit of newer
+    ghr_custom_2 = (ghr_custom_2 << 1) | new_bit;               // newer 64 bits shift in new outcome
+}
+
+
 void init_predictor()
 {
   switch (bpType)
@@ -295,6 +577,7 @@ void init_predictor()
     init_tournament();
     break;
   case CUSTOM:
+    init_tage();
     break;
   default:
     break;
@@ -318,7 +601,7 @@ uint32_t make_prediction(uint32_t pc, uint32_t target, uint32_t direct)
   case TOURNAMENT:
     return tournament_predict(pc);
   case CUSTOM:
-    return NOTTAKEN;
+    return tage_predict(pc);
   default:
     break;
   }
@@ -345,7 +628,7 @@ void train_predictor(uint32_t pc, uint32_t target, uint32_t outcome, uint32_t co
     case TOURNAMENT:
       return train_tournament(pc, outcome);;
     case CUSTOM:
-      return;
+      return train_tage(pc, outcome);
     default:
       break;
     }

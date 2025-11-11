@@ -62,11 +62,6 @@ extern const char *bpName[];
 #define VALID 1
 #define INVALID 0
 
-//sizes for TAGE
-#define BASE_ENTRIES      (1 << 11)   // 2048
-#define NUM_TAG_TABLES    4
-#define TAG_ENTRIES       (1 << 10)   // 1024 per tagged table
-
 //------------------------------------//
 //      Predictor Configuration       //
 //------------------------------------//
